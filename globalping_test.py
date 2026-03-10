@@ -413,28 +413,18 @@ def _stats_row(stats):
 
 
 def display_results(target, results, chosen_region, chosen_asn, network_name):
-    region_probes = []
-    asn_probes = []
+    # Globalping returns results in selector order: first REGION_LIMIT entries are
+    # from the region selector, the rest from the ASN selector.  Splitting by index
+    # is the only reliable approach — post-hoc string matching on region/ASN fails
+    # when probe location strings differ from the selector values we submitted.
+    REGION_LIMIT = 2
+    region_probes = results[:REGION_LIMIT]
+    asn_probes    = results[REGION_LIMIT:]
 
-    for r in results:
-        probe_raw = r.get("probe", {})
-        probe_loc = probe_raw.get("location") or probe_raw
-        probe_asn = probe_loc.get("asn")
-        probe_region = probe_loc.get("region")
-        if probe_asn == chosen_asn:
-            asn_probes.append(r)
-        elif probe_region == chosen_region:
-            region_probes.append(r)
-        else:
-            if len(region_probes) <= len(asn_probes):
-                region_probes.append(r)
-            else:
-                asn_probes.append(r)
-
-    def print_group(title, group, show_region=False):
+    def print_group(title, group):
         print(section_header(title))
         if not group:
-            print(f"\n  {DIM}no probes{R}")
+            print(f"\n  {DIM}no results{R}")
             return
         for i, r in enumerate(group, 1):
             probe_raw = r.get("probe", {})
