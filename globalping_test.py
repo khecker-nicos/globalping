@@ -7,11 +7,13 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -23,44 +25,39 @@ _COLOR = sys.stdout.isatty() or bool(os.environ.get("FORCE_COLOR"))
 def _a(*codes):
     return "".join(f"\033[{c}m" for c in codes) if _COLOR else ""
 
-R   = _a(0)          # reset
-B   = _a(1)          # bold
-DIM = _a(2)          # dim
+R   = _a(0);  B   = _a(1);  DIM = _a(2)
+BCY = _a(96); BGR = _a(92); BYL = _a(93); BRD = _a(91)
+BBL = _a(94); BWH = _a(97)
 
-CY  = _a(36);  BCY  = _a(96)   # cyan
-GR  = _a(32);  BGR  = _a(92)   # green
-YL  = _a(33);  BYL  = _a(93)   # yellow
-RD  = _a(31);  BRD  = _a(91)   # red
-BL  = _a(34);  BBL  = _a(94)   # blue
-MG  = _a(35);  BMG  = _a(95)   # magenta
-WH  = _a(37);  BWH  = _a(97)   # white
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+def _vlen(s):
+    """Visible length of a string (strips ANSI codes)."""
+    return len(_ANSI_RE.sub("", s))
+
+def _ljust(s, width):
+    """Left-justify s to visible width (ANSI-safe)."""
+    return s + " " * max(0, width - _vlen(s))
 
 def tw():
-    """Terminal width, capped for readability."""
     return min(shutil.get_terminal_size((80, 24)).columns, 100)
 
-def rule(char="─", w=None, color=DIM):
-    return f"{color}{char * (w or tw())}{R}"
+def rule(char="─", w=None):
+    return f"{DIM}{char * (w or tw())}{R}"
 
-def section_header(title, color=BCY):
+def section_header(title):
     w = tw()
-    bar = "─" * w
-    return f"\n{DIM}{bar}{R}\n{color}{B} {title}{R}\n{DIM}{bar}{R}"
+    return f"\n{DIM}{'─' * w}{R}\n{BCY}{B} {title}{R}\n{DIM}{'─' * w}{R}"
 
 def kv(key, val, key_width=12):
     return f"  {DIM}{key:<{key_width}}{R}  {BWH}{val}{R}"
 
-def latency_color(ms):
+def fmt_latency(ms):
     try:
         v = float(ms)
-        if v < 15:   return BGR
-        elif v < 50: return BYL
-        else:        return BRD
+        c = BGR if v < 15 else (BYL if v < 50 else BRD)
     except (TypeError, ValueError):
-        return DIM
-
-def fmt_latency(ms):
-    c = latency_color(ms)
+        c = DIM
     return f"{c}{ms}ms{R}"
 
 def fmt_loss(pct):
@@ -73,9 +70,14 @@ def fmt_loss(pct):
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-BASE_URL = "https://api.globalping.io/v1"
-POLL_INTERVAL = 0.5
-POLL_TIMEOUT = 60
+# ── Constants ─────────────────────────────────────────────────────────────────
+BASE_URL       = "https://api.globalping.io/v1"
+GEOIP_URL      = "https://ipwho.is/{ip}"          # HTTPS, free, no key required
+USER_AGENT     = "globalping-test/1.0 (github.com/khecker-nicos/globalping)"
+REQUEST_TIMEOUT = 15   # seconds per HTTP call
+POLL_INTERVAL  = 0.5   # seconds between status polls (per API spec)
+POLL_TIMEOUT   = 60    # seconds before giving up
+MAX_RETRIES    = 3     # retries on transient network errors
 
 # UN M49 region names — exactly as enumerated in the globalping API spec
 COUNTRY_TO_REGION = {
@@ -169,63 +171,96 @@ COUNTRY_TO_REGION = {
 }
 
 
+# ── Input validation ──────────────────────────────────────────────────────────
+
+def validate_target(target):
+    """Accept valid IPv4, IPv6, or hostname. Exit on clearly invalid input."""
+    try:
+        ipaddress.ip_address(target)
+        return  # valid IP
+    except ValueError:
+        pass
+    # Hostname: labels separated by dots, each 1-63 chars, total ≤253
+    hostname_re = re.compile(
+        r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*"
+        r"[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$"
+    )
+    if not hostname_re.match(target) or len(target) > 253:
+        print(f"Error: '{target}' is not a valid IP address or hostname.", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── GeoIP lookup (HTTPS) ──────────────────────────────────────────────────────
+
 def geoip_lookup(ip):
     """
-    Query ip-api.com for geographic and network info about the target IP.
-    Returns a dict with: asn (int), country (str), region (str), city (str),
-    network (str), isp (str).
+    Query ipwho.is (HTTPS, free, no key) for geographic and network info.
+    Returns dict: asn (int|None), country (str|None), region (str|None),
+                  city (str|None), network (str|None), isp (str|None).
     """
-    info = {"asn": None, "country": None, "region": None, "city": None, "network": None, "isp": None}
-    fields = "status,message,countryCode,city,isp,org,as"
-    url = f"http://ip-api.com/json/{ip}?fields={fields}"
+    info = {"asn": None, "country": None, "region": None,
+            "city": None, "network": None, "isp": None}
+    url = GEOIP_URL.format(ip=ip)
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"\r  {BYL}⚠{R}  GeoIP failed ({e}) — falling back")
         return info
 
-    if data.get("status") != "success":
-        print(f"\r  {BYL}⚠{R}  GeoIP: {data.get('message', 'unknown error')} — falling back")
+    if not data.get("success"):
+        msg = data.get("message") or data.get("type") or "unknown error"
+        print(f"\r  {BYL}⚠{R}  GeoIP: {msg} — falling back")
         return info
 
-    # "as" field is e.g. "AS15169 Google LLC"
-    m = re.match(r"AS(\d+)", data.get("as", ""))
-    if m:
-        info["asn"] = int(m.group(1))
-
-    info["country"] = data.get("countryCode")
-    info["region"] = COUNTRY_TO_REGION.get(info["country"] or "")
-    info["city"] = data.get("city")
-    info["isp"] = data.get("isp")
-    info["network"] = data.get("org") or data.get("isp")
-
+    conn = data.get("connection") or {}
+    info["asn"]     = conn.get("asn")                        # already an int
+    info["country"] = data.get("country_code")
+    info["city"]    = data.get("city")
+    info["isp"]     = conn.get("isp")
+    info["network"] = conn.get("org") or conn.get("isp")
+    info["region"]  = COUNTRY_TO_REGION.get(info["country"] or "")
     return info
 
 
+# ── Globalping API ────────────────────────────────────────────────────────────
+
 def make_request(path, method="GET", data=None, token=None):
+    """
+    HTTP request to the globalping API with timeout and retry on transient errors.
+    Exits on HTTP errors (4xx/5xx).
+    """
     url = BASE_URL + path
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept":       "application/json",
+        "User-Agent":   USER_AGENT,
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    body = None
     if data is not None:
         body = json.dumps(data).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    else:
-        body = None
 
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode("utf-8", errors="replace")
-        print(f"HTTP Error {e.code}: {body_text}", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Network error: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")
+            print(f"\n{BRD}HTTP {e.code}{R}: {body_text}", file=sys.stderr)
+            sys.exit(1)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)   # 1s, 2s backoff
+                continue
+            print(f"\n{BRD}Network error{R}: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def fetch_probes(token):
@@ -235,63 +270,61 @@ def fetch_probes(token):
 
 def select_groups(probes, target_asn, target_country):
     """
-    Select a region group and an ASN group for the measurement.
-
     Region priority:
-      1. A region that has probes in the same country as the target  (best geographic match)
-      2. A region that has probes in a neighbouring country (same continent via probe data)
-      3. Most-populated eligible region                              (last resort)
+      1. Region whose probes include the target country (exact geographic match)
+      2. Region whose probes are most concentrated on the same continent
+      3. Most-populated eligible region (last resort)
 
     ASN priority:
-      1. Same ASN as the target (probes on the same ISP)
-      2. Most-populated ASN not already dominant in the region group (diversity)
+      1. Same ASN as target (identical ISP)
+      2. Different ASN with probes in same country (local competitor/peer)
+      3. Different ASN with probes in same region (regional ISP)
+      4. Most-populated ASN not dominant in region group (diversity fallback)
     """
     region_groups = defaultdict(list)
-    asn_groups = defaultdict(list)
+    asn_groups    = defaultdict(list)
 
     for probe in probes:
-        loc = probe.get("location", {})
-        region = loc.get("region")
-        asn = loc.get("asn")
-        if region:
-            region_groups[region].append(probe)
-        if asn:
-            asn_groups[asn].append(probe)
+        loc = probe.get("location") or {}
+        if loc.get("region"):
+            region_groups[loc["region"]].append(probe)
+        if loc.get("asn"):
+            asn_groups[loc["asn"]].append(probe)
 
     eligible_regions = {r: ps for r, ps in region_groups.items() if len(ps) >= 2}
     if not eligible_regions:
-        print("Error: No region has >=2 available probes.", file=sys.stderr)
+        print("Error: no region has ≥2 available probes.", file=sys.stderr)
         sys.exit(1)
 
-    # --- Region: probe-data-driven selection ---
-    chosen_region = None
-    region_source = None
+    # ── Region selection ──────────────────────────────────────────────────────
+    chosen_region = region_source = None
 
     if target_country:
-        # 1. Region containing probes from exactly the target country
+        # 1. Exact country match inside probe data
         for region, rprobes in eligible_regions.items():
-            if any(p.get("location", {}).get("country") == target_country for p in rprobes):
+            if any((p.get("location") or {}).get("country") == target_country
+                   for p in rprobes):
                 chosen_region = region
                 region_source = f"geoip (probes in {target_country})"
                 break
 
         if not chosen_region:
-            # 2. Same continent: find which continent our country belongs to based on
-            #    probes whose country matches — pick the region with the most such probes
-            target_continent = COUNTRY_TO_REGION.get(target_country, "")
-            # Build a set of countries on the same continent
-            same_continent_countries = {c for c, r in COUNTRY_TO_REGION.items() if r == target_continent}
+            # 2. Continent proximity — score each region by same-continent probe count
+            target_continent_region = COUNTRY_TO_REGION.get(target_country, "")
+            same_continent = {
+                c for c, r in COUNTRY_TO_REGION.items() if r == target_continent_region
+            }
             scored = {
                 region: sum(
                     1 for p in rprobes
-                    if p.get("location", {}).get("country") in same_continent_countries
+                    if (p.get("location") or {}).get("country") in same_continent
                 )
                 for region, rprobes in eligible_regions.items()
             }
-            best_score = max(scored.values(), default=0)
-            if best_score > 0:
+            best = max(scored.values(), default=0)
+            if best > 0:
                 chosen_region = max(
-                    (r for r, s in scored.items() if s == best_score),
+                    (r for r, s in scored.items() if s == best),
                     key=lambda r: len(eligible_regions[r]),
                 )
                 region_source = f"geoip (nearest region to {target_country})"
@@ -301,123 +334,111 @@ def select_groups(probes, target_asn, target_country):
         region_source = "most probes (no geoip match)"
 
     region_asns = {
-        p["location"]["asn"]
+        (p.get("location") or {}).get("asn")
         for p in eligible_regions[chosen_region]
-        if p.get("location", {}).get("asn")
+        if (p.get("location") or {}).get("asn")
     }
 
-    # --- ASN selection ---
-    # Priority:
-    #   1. Same ASN as target (identical ISP — best path insight)
-    #   2. Different ASN but probes in same country as target (local peer/competitor ISP)
-    #   3. Different ASN but probes in same region as target (regional ISP)
-    #   4. Most-populated ASN not already dominant in region group (diversity fallback)
+    # ── ASN selection ─────────────────────────────────────────────────────────
     eligible_asns = {a: ps for a, ps in asn_groups.items() if len(ps) >= 2}
     if not eligible_asns:
-        print("Error: No ASN has >=2 available probes.", file=sys.stderr)
+        print("Error: no ASN has ≥2 available probes.", file=sys.stderr)
         sys.exit(1)
 
-    # Build sets of countries in the same region for step 3
-    target_region_countries = (
+    same_region_countries = (
         {c for c, r in COUNTRY_TO_REGION.items() if r == COUNTRY_TO_REGION.get(target_country, "")}
         if target_country else set()
     )
 
-    chosen_asn = None
-    asn_source = None
+    chosen_asn = asn_source = None
 
-    # 1. Exact ASN match
+    # 1. Same ASN
     if target_asn and target_asn in eligible_asns:
         chosen_asn = target_asn
         asn_source = "geoip (same ISP as target)"
 
     # 2. Same country, different ASN
     if not chosen_asn and target_country:
-        same_country_asns = {
+        pool = {
             a: ps for a, ps in eligible_asns.items()
             if a != target_asn
-            and any(p.get("location", {}).get("country") == target_country for p in ps)
+            and any((p.get("location") or {}).get("country") == target_country for p in ps)
         }
-        if same_country_asns:
-            chosen_asn = max(same_country_asns, key=lambda a: len(same_country_asns[a]))
-            net = eligible_asns[chosen_asn][0].get("location", {}).get("network", "")
+        if pool:
+            chosen_asn = max(pool, key=lambda a: len(pool[a]))
+            net = (eligible_asns[chosen_asn][0].get("location") or {}).get("network", "")
             asn_source = f"geoip (ISP in {target_country}: {net})"
 
     # 3. Same region, different ASN
-    if not chosen_asn and target_region_countries:
-        same_region_asns = {
+    if not chosen_asn and same_region_countries:
+        pool = {
             a: ps for a, ps in eligible_asns.items()
             if a != target_asn
-            and any(p.get("location", {}).get("country") in target_region_countries for p in ps)
+            and any((p.get("location") or {}).get("country") in same_region_countries for p in ps)
         }
-        if same_region_asns:
-            chosen_asn = max(same_region_asns, key=lambda a: len(same_region_asns[a]))
-            net = eligible_asns[chosen_asn][0].get("location", {}).get("network", "")
-            asn_source = f"geoip (nearby ISP in region: {net})"
+        if pool:
+            chosen_asn = max(pool, key=lambda a: len(pool[a]))
+            net = (eligible_asns[chosen_asn][0].get("location") or {}).get("network", "")
+            asn_source = f"geoip (nearby ISP: {net})"
 
-    # 4. Fallback: most probes, prefer diversity from region group
+    # 4. Fallback
     if not chosen_asn:
-        non_overlap = {a: ps for a, ps in eligible_asns.items() if a not in region_asns}
-        pool = non_overlap if non_overlap else eligible_asns
+        pool = {a: ps for a, ps in eligible_asns.items() if a not in region_asns}
+        pool = pool or eligible_asns
         chosen_asn = max(pool, key=lambda a: len(pool[a]))
         asn_source = "most probes (diverse)"
 
-    network_name = eligible_asns[chosen_asn][0].get("location", {}).get("network", "")
+    network_name = (eligible_asns[chosen_asn][0].get("location") or {}).get("network", "")
     return chosen_region, region_source, chosen_asn, asn_source, network_name
 
 
 def create_measurement(target, region, asn, packets, protocol, token):
     payload = {
-        "type": "mtr",
+        "type":   "mtr",
         "target": target,
         "locations": [
             {"region": region, "limit": 2},
-            {"asn": asn, "limit": 2},
+            {"asn":    asn,    "limit": 2},
         ],
-        "measurementOptions": {
-            "packets": packets,
-            "protocol": protocol,
-        },
+        "measurementOptions": {"packets": packets, "protocol": protocol},
         "inProgressUpdates": False,
     }
-    status, resp = make_request("/measurements", method="POST", data=payload, token=token)
-    if status not in (200, 201, 202):
-        print(f"Unexpected status {status}: {resp}", file=sys.stderr)
-        sys.exit(1)
+    _, resp = make_request("/measurements", method="POST", data=payload, token=token)
     return resp["id"]
 
 
 def poll_measurement(measurement_id, token):
-    deadline = time.time() + POLL_TIMEOUT
+    deadline = time.monotonic() + POLL_TIMEOUT
     spin_i = 0
     while True:
         _, data = make_request(f"/measurements/{measurement_id}", token=token)
         if data.get("status") != "in-progress":
             print(f"\r  {BGR}✓{R} done{' ' * 20}")
             return data
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             print(f"\r  {BYL}⚠{R} timeout — showing partial results")
             return data
-        frame = SPINNER[spin_i % len(SPINNER)]
-        print(f"\r  {BCY}{frame}{R} measuring…", end="", flush=True)
+        print(f"\r  {BCY}{SPINNER[spin_i % len(SPINNER)]}{R} measuring…",
+              end="", flush=True)
         spin_i += 1
         time.sleep(POLL_INTERVAL)
 
 
+# ── Display ───────────────────────────────────────────────────────────────────
+
 def _probe_header(probe_loc, index):
-    city    = probe_loc.get("city") or ""
+    city    = probe_loc.get("city")    or ""
     country = probe_loc.get("country") or ""
     asn_val = probe_loc.get("asn")
     net     = probe_loc.get("network") or ""
-    region  = probe_loc.get("region") or ""
+    region  = probe_loc.get("region")  or ""
 
     place   = ", ".join(filter(None, [city, country])) or "unknown location"
     asn_str = f"AS{asn_val}" if asn_val else "AS?"
     net_str = f"  {DIM}·  {net}{R}" if net else ""
-    region_str = f"  {DIM}({region}){R}" if region else ""
+    reg_str = f"  {DIM}({region}){R}" if region else ""
 
-    num = f"{BCY}{B} {index} {R}"
-    return f"\n  {num}  {BWH}{B}{place}{R}  {DIM}{asn_str}{R}{net_str}{region_str}"
+    return f"\n  {BCY}{B} {index} {R}  {BWH}{B}{place}{R}  {DIM}{asn_str}{R}{net_str}{reg_str}"
 
 
 def _stats_row(stats):
@@ -427,22 +448,21 @@ def _stats_row(stats):
     avg  = stats.get("avg",  "?")
     min_ = stats.get("min",  "?")
     max_ = stats.get("max",  "?")
+    # Use _ljust to pad by visible width, not byte count (ANSI codes are invisible)
     return (
-        f"  {DIM}LOSS{R}  {fmt_loss(loss):<20}"
-        f"  {DIM}AVG{R}  {fmt_latency(avg):<20}"
-        f"  {DIM}BEST{R}  {fmt_latency(min_):<20}"
+        f"  {_ljust(f'{DIM}LOSS{R}  {fmt_loss(loss)}', 28)}"
+        f"  {_ljust(f'{DIM}AVG{R}  {fmt_latency(avg)}', 27)}"
+        f"  {_ljust(f'{DIM}BEST{R}  {fmt_latency(min_)}', 28)}"
         f"  {DIM}WORST{R}  {fmt_latency(max_)}"
     )
 
 
 def display_results(target, results, chosen_region, chosen_asn, network_name):
-    # Globalping returns results in selector order: first REGION_LIMIT entries are
-    # from the region selector, the rest from the ASN selector.  Splitting by index
-    # is the only reliable approach — post-hoc string matching on region/ASN fails
-    # when probe location strings differ from the selector values we submitted.
-    REGION_LIMIT = 2
-    region_probes = results[:REGION_LIMIT]
-    asn_probes    = results[REGION_LIMIT:]
+    # Results are returned in selector order: first 2 = region, rest = ASN.
+    # Index-based split is the only reliable approach — probe location strings
+    # may differ from the selector values we submitted.
+    region_probes = results[:2]
+    asn_probes    = results[2:]
 
     def print_group(title, group):
         print(section_header(title))
@@ -450,11 +470,11 @@ def display_results(target, results, chosen_region, chosen_asn, network_name):
             print(f"\n  {DIM}no results{R}")
             return
         for i, r in enumerate(group, 1):
-            probe_raw = r.get("probe", {})
+            probe_raw = r.get("probe") or {}
             probe_loc = probe_raw.get("location") or probe_raw
-            result    = r.get("result", {})
-            hops      = result.get("hops", [])
-            raw       = result.get("rawOutput", "")
+            result    = r.get("result") or {}
+            hops      = result.get("hops") or []
+            raw       = result.get("rawOutput") or ""
 
             print(_probe_header(probe_loc, i))
 
@@ -474,20 +494,21 @@ def display_results(target, results, chosen_region, chosen_asn, network_name):
     print(f"\n{rule()}\n")
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test a target IP using globalping.io MTR measurements."
     )
     parser.add_argument("target_ip", help="Target IP address or hostname")
-    parser.add_argument("--token", help="Optional Bearer token for higher rate limits")
-    parser.add_argument("--packets", type=int, default=5, help="MTR packet count (default: 5)")
-    parser.add_argument(
-        "--protocol",
-        choices=["ICMP", "TCP", "UDP"],
-        default="ICMP",
-        help="MTR protocol (default: ICMP)",
-    )
+    parser.add_argument("--token",    help="Bearer token for higher rate limits")
+    parser.add_argument("--packets",  type=int, default=5,
+                        help="MTR packet count per hop (default: 5)")
+    parser.add_argument("--protocol", choices=["ICMP", "TCP", "UDP"], default="ICMP",
+                        help="MTR protocol (default: ICMP)")
     args = parser.parse_args()
+
+    validate_target(args.target_ip)
 
     # ── Header ────────────────────────────────────────────────────────────────
     w = tw()
@@ -496,37 +517,55 @@ def main():
           f"{DIM}{args.protocol}  ·  {args.packets} packets{R}")
     print(f"{BBL}{'━' * w}{R}")
 
-    # ── GeoIP lookup ──────────────────────────────────────────────────────────
-    print(f"\n{DIM}  resolving target…{R}", end="", flush=True)
-    target_info = geoip_lookup(args.target_ip)
+    # ── Parallel: GeoIP + probe list ─────────────────────────────────────────
+    print(f"\n{DIM}  resolving…{R}", end="", flush=True)
+
+    geoip_result: dict = {}
+    probes_result: list = []
+    errors: list = []
+
+    def _do_geoip():
+        geoip_result.update(geoip_lookup(args.target_ip))
+
+    def _do_probes():
+        try:
+            probes_result.extend(fetch_probes(args.token))
+        except SystemExit as e:
+            errors.append(e)
+
+    t_geoip  = threading.Thread(target=_do_geoip,  daemon=True)
+    t_probes = threading.Thread(target=_do_probes, daemon=True)
+    t_geoip.start();  t_probes.start()
+    t_geoip.join();   t_probes.join()
+
     print("\r", end="")
 
-    if target_info["city"] or target_info["country"]:
-        location = ", ".join(filter(None, [target_info["city"], target_info["country"]]))
-        region_label = target_info["region"] or "unknown region"
+    if errors:
+        sys.exit(errors[0].code)
+
+    # ── Display GeoIP info ────────────────────────────────────────────────────
+    if geoip_result.get("city") or geoip_result.get("country"):
+        location = ", ".join(filter(None, [geoip_result["city"], geoip_result["country"]]))
+        region_label = geoip_result.get("region") or "unknown region"
         print(kv("target", f"{BWH}{location}{R}  {DIM}→  {region_label}{R}"))
     else:
         print(kv("target", f"{DIM}location unknown{R}"))
 
-    if target_info["asn"]:
-        isp = target_info["network"] or target_info["isp"] or "?"
-        print(kv("isp / asn", f"AS{target_info['asn']}  {DIM}·  {isp}{R}"))
+    if geoip_result.get("asn"):
+        isp = geoip_result.get("network") or geoip_result.get("isp") or "?"
+        print(kv("isp / asn", f"AS{geoip_result['asn']}  {DIM}·  {isp}{R}"))
     else:
         print(kv("isp / asn", f"{DIM}not found{R}"))
 
-    # ── Probe discovery ───────────────────────────────────────────────────────
-    print(f"\n{DIM}  fetching probes…{R}", end="", flush=True)
-    probes = fetch_probes(args.token)
-    print("\r", end="")
-
+    # ── Select probes ─────────────────────────────────────────────────────────
     chosen_region, region_source, chosen_asn, asn_source, network_name = select_groups(
-        probes, target_info["asn"], target_info["country"]
+        probes_result, geoip_result.get("asn"), geoip_result.get("country")
     )
-    print(kv("probes", f"{BGR}{len(probes)}{R} online"))
-    print(kv("region", f"{BCY}{chosen_region}{R}  {DIM}· {region_source}{R}"))
-    print(kv("asn", f"{BCY}AS{chosen_asn}  ·  {network_name}{R}  {DIM}· {asn_source}{R}"))
+    print(kv("probes",  f"{BGR}{len(probes_result)}{R} online"))
+    print(kv("region",  f"{BCY}{chosen_region}{R}  {DIM}· {region_source}{R}"))
+    print(kv("asn",     f"{BCY}AS{chosen_asn}  ·  {network_name}{R}  {DIM}· {asn_source}{R}"))
 
-    # ── Measurement ───────────────────────────────────────────────────────────
+    # ── Measure ───────────────────────────────────────────────────────────────
     print()
     measurement_id = create_measurement(
         args.target_ip, chosen_region, chosen_asn, args.packets, args.protocol, args.token
@@ -534,10 +573,10 @@ def main():
     print(f"  {DIM}id  {measurement_id}{R}")
 
     data = poll_measurement(measurement_id, args.token)
-    results = data.get("results", [])
+    results = data.get("results") or []
 
     if not results:
-        print("No results returned.", file=sys.stderr)
+        print(f"{BRD}No results returned.{R}", file=sys.stderr)
         sys.exit(1)
 
     display_results(args.target_ip, results, chosen_region, chosen_asn, network_name)
