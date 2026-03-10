@@ -74,16 +74,16 @@ def fmt_loss(pct):
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 BASE_URL = "https://api.globalping.io/v1"
-POLL_INTERVAL = 2
+POLL_INTERVAL = 0.5
 POLL_TIMEOUT = 60
 
-# UN geoscheme → globalping region labels
+# UN M49 region names — exactly as enumerated in the globalping API spec
 COUNTRY_TO_REGION = {
     # Northern Europe
     "DK": "Northern Europe", "EE": "Northern Europe", "FI": "Northern Europe",
     "IS": "Northern Europe", "IE": "Northern Europe", "LV": "Northern Europe",
     "LT": "Northern Europe", "NO": "Northern Europe", "SE": "Northern Europe",
-    "GB": "Northern Europe", "UK": "Northern Europe",
+    "GB": "Northern Europe",
     # Western Europe
     "AT": "Western Europe", "BE": "Western Europe", "FR": "Western Europe",
     "DE": "Western Europe", "LI": "Western Europe", "LU": "Western Europe",
@@ -101,25 +101,30 @@ COUNTRY_TO_REGION = {
     "RO": "Eastern Europe", "RU": "Eastern Europe", "SK": "Eastern Europe",
     "UA": "Eastern Europe",
     # Northern America
-    "CA": "Northern America", "US": "Northern America", "PM": "Northern America",
-    # Latin America
-    "MX": "Latin America", "GT": "Latin America", "BZ": "Latin America",
-    "HN": "Latin America", "SV": "Latin America", "NI": "Latin America",
-    "CR": "Latin America", "PA": "Latin America", "CU": "Latin America",
-    "JM": "Latin America", "HT": "Latin America", "DO": "Latin America",
-    "PR": "Latin America", "TT": "Latin America", "BR": "Latin America",
-    "AR": "Latin America", "CL": "Latin America", "CO": "Latin America",
-    "VE": "Latin America", "PE": "Latin America", "EC": "Latin America",
-    "BO": "Latin America", "PY": "Latin America", "UY": "Latin America",
-    "GY": "Latin America", "SR": "Latin America",
-    # East Asia
-    "CN": "East Asia", "HK": "East Asia", "JP": "East Asia",
-    "KR": "East Asia", "MN": "East Asia", "MO": "East Asia", "TW": "East Asia",
-    # Southeast Asia
-    "BN": "Southeast Asia", "KH": "Southeast Asia", "ID": "Southeast Asia",
-    "LA": "Southeast Asia", "MY": "Southeast Asia", "MM": "Southeast Asia",
-    "PH": "Southeast Asia", "SG": "Southeast Asia", "TH": "Southeast Asia",
-    "TL": "Southeast Asia", "VN": "Southeast Asia",
+    "CA": "Northern America", "US": "Northern America", "GL": "Northern America",
+    "BM": "Northern America", "PM": "Northern America",
+    # Central America
+    "MX": "Central America", "GT": "Central America", "BZ": "Central America",
+    "HN": "Central America", "SV": "Central America", "NI": "Central America",
+    "CR": "Central America", "PA": "Central America",
+    # Caribbean
+    "CU": "Caribbean", "JM": "Caribbean", "HT": "Caribbean", "DO": "Caribbean",
+    "PR": "Caribbean", "TT": "Caribbean", "BB": "Caribbean", "LC": "Caribbean",
+    "VC": "Caribbean", "GD": "Caribbean", "AG": "Caribbean", "DM": "Caribbean",
+    "KN": "Caribbean",
+    # South America
+    "BR": "South America", "AR": "South America", "CL": "South America",
+    "CO": "South America", "VE": "South America", "PE": "South America",
+    "EC": "South America", "BO": "South America", "PY": "South America",
+    "UY": "South America", "GY": "South America", "SR": "South America",
+    # Eastern Asia
+    "CN": "Eastern Asia", "HK": "Eastern Asia", "JP": "Eastern Asia",
+    "KR": "Eastern Asia", "MN": "Eastern Asia", "MO": "Eastern Asia", "TW": "Eastern Asia",
+    # South-eastern Asia
+    "BN": "South-eastern Asia", "KH": "South-eastern Asia", "ID": "South-eastern Asia",
+    "LA": "South-eastern Asia", "MY": "South-eastern Asia", "MM": "South-eastern Asia",
+    "PH": "South-eastern Asia", "SG": "South-eastern Asia", "TH": "South-eastern Asia",
+    "TL": "South-eastern Asia", "VN": "South-eastern Asia",
     # Southern Asia
     "AF": "Southern Asia", "BD": "Southern Asia", "BT": "Southern Asia",
     "IN": "Southern Asia", "IR": "Southern Asia", "MV": "Southern Asia",
@@ -134,15 +139,33 @@ COUNTRY_TO_REGION = {
     # Central Asia
     "KZ": "Central Asia", "KG": "Central Asia", "TJ": "Central Asia",
     "TM": "Central Asia", "UZ": "Central Asia",
-    # Africa
-    "DZ": "Africa", "EG": "Africa", "LY": "Africa", "MA": "Africa",
-    "TN": "Africa", "SD": "Africa", "NG": "Africa", "KE": "Africa",
-    "ET": "Africa", "TZ": "Africa", "GH": "Africa", "ZA": "Africa",
-    "UG": "Africa", "MZ": "Africa", "AO": "Africa", "CM": "Africa",
-    "CI": "Africa", "SN": "Africa",
-    # Oceania
-    "AU": "Oceania", "NZ": "Oceania", "FJ": "Oceania", "PG": "Oceania",
-    "WS": "Oceania", "SB": "Oceania", "VU": "Oceania",
+    # Northern Africa
+    "DZ": "Northern Africa", "EG": "Northern Africa", "LY": "Northern Africa",
+    "MA": "Northern Africa", "TN": "Northern Africa", "SD": "Northern Africa",
+    # Western Africa
+    "NG": "Western Africa", "GH": "Western Africa", "SN": "Western Africa",
+    "CI": "Western Africa", "ML": "Western Africa", "BF": "Western Africa",
+    "NE": "Western Africa", "GM": "Western Africa", "GN": "Western Africa",
+    "SL": "Western Africa", "LR": "Western Africa", "TG": "Western Africa",
+    "BJ": "Western Africa", "MR": "Western Africa", "CV": "Western Africa",
+    # Eastern Africa
+    "KE": "Eastern Africa", "ET": "Eastern Africa", "TZ": "Eastern Africa",
+    "UG": "Eastern Africa", "MZ": "Eastern Africa", "MG": "Eastern Africa",
+    "ZM": "Eastern Africa", "ZW": "Eastern Africa", "RW": "Eastern Africa",
+    "SO": "Eastern Africa", "DJ": "Eastern Africa", "ER": "Eastern Africa",
+    # Middle Africa
+    "AO": "Middle Africa", "CM": "Middle Africa", "CD": "Middle Africa",
+    "CG": "Middle Africa", "CF": "Middle Africa", "TD": "Middle Africa",
+    "GQ": "Middle Africa", "GA": "Middle Africa",
+    # Southern Africa
+    "ZA": "Southern Africa", "NA": "Southern Africa", "BW": "Southern Africa",
+    "LS": "Southern Africa", "SZ": "Southern Africa",
+    # Australia and New Zealand
+    "AU": "Australia and New Zealand", "NZ": "Australia and New Zealand",
+    # Melanesia
+    "FJ": "Melanesia", "PG": "Melanesia", "SB": "Melanesia", "VU": "Melanesia",
+    # Polynesia
+    "WS": "Polynesia", "TO": "Polynesia", "TV": "Polynesia",
 }
 
 
@@ -349,7 +372,7 @@ def create_measurement(target, region, asn, packets, protocol, token):
         "target": target,
         "locations": [
             {"region": region, "limit": 2},
-            {"magic": f"AS{asn}", "limit": 2},
+            {"asn": asn, "limit": 2},
         ],
         "measurementOptions": {
             "packets": packets,
