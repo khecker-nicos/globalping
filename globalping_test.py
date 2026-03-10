@@ -407,19 +407,22 @@ def create_measurement(target, region, asn, packets, protocol, token):
     return resp["id"]
 
 
-def poll_measurement(measurement_id, token):
+def poll_measurement(measurement_id, token, quiet=False):
     deadline = time.monotonic() + POLL_TIMEOUT
     spin_i = 0
     while True:
         _, data = make_request(f"/measurements/{measurement_id}", token=token)
         if data.get("status") != "in-progress":
-            print(f"\r  {BGR}✓{R} done{' ' * 20}")
+            if not quiet:
+                print(f"\r  {BGR}✓{R} done{' ' * 20}")
             return data
         if time.monotonic() >= deadline:
-            print(f"\r  {BYL}⚠{R} timeout — showing partial results")
+            if not quiet:
+                print(f"\r  {BYL}⚠{R} timeout — showing partial results")
             return data
-        print(f"\r  {BCY}{SPINNER[spin_i % len(SPINNER)]}{R} measuring…",
-              end="", flush=True)
+        if not quiet:
+            print(f"\r  {BCY}{SPINNER[spin_i % len(SPINNER)]}{R} measuring…",
+                  end="", flush=True)
         spin_i += 1
         time.sleep(POLL_INTERVAL)
 
@@ -494,6 +497,50 @@ def display_results(target, results, chosen_region, chosen_asn, network_name):
     print(f"\n{rule()}\n")
 
 
+def build_json_output(target, geoip, probe_selection, results):
+    """
+    Build a clean, self-contained dict suitable for JSON output.
+    Designed for LLM / programmatic consumption — no ANSI, all values typed.
+    """
+    def probe_result(r):
+        probe_raw = r.get("probe") or {}
+        probe_loc = probe_raw.get("location") or probe_raw
+        result    = r.get("result") or {}
+        hops      = result.get("hops") or []
+        stats     = result.get("stats") or (hops[-1].get("stats") if hops else None)
+        return {
+            "probe": {
+                "city":    probe_loc.get("city"),
+                "country": probe_loc.get("country"),
+                "region":  probe_loc.get("region"),
+                "asn":     probe_loc.get("asn"),
+                "network": probe_loc.get("network"),
+            },
+            "stats": stats,
+            "hop_count": len(hops),
+            "hops": [
+                {
+                    "address":  h.get("resolvedAddress"),
+                    "hostname": h.get("resolvedHostname"),
+                    "asn":      h.get("asn"),
+                    "stats":    h.get("stats"),
+                }
+                for h in hops
+            ],
+            "raw_output": result.get("rawOutput"),
+        }
+
+    return {
+        "target":          target,
+        "target_info":     geoip,
+        "probe_selection": probe_selection,
+        "results": {
+            "by_region": [probe_result(r) for r in results[:2]],
+            "by_asn":    [probe_result(r) for r in results[2:]],
+        },
+    }
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -506,19 +553,25 @@ def main():
                         help="MTR packet count per hop (default: 5)")
     parser.add_argument("--protocol", choices=["ICMP", "TCP", "UDP"], default="ICMP",
                         help="MTR protocol (default: ICMP)")
+    parser.add_argument("--json", dest="json_out", action="store_true",
+                        help="Output results as JSON (progress printed to stderr)")
     args = parser.parse_args()
 
     validate_target(args.target_ip)
 
+    # In JSON mode all progress goes to stderr so stdout stays clean for piping
+    log = (lambda *a, **kw: print(*a, **kw, file=sys.stderr)) if args.json_out else print
+
     # ── Header ────────────────────────────────────────────────────────────────
-    w = tw()
-    print(f"\n{BBL}{'━' * w}{R}")
-    print(f"{BBL}{B}  GLOBALPING MTR{R}  {DIM}·{R}  {BWH}{B}{args.target_ip}{R}  "
-          f"{DIM}{args.protocol}  ·  {args.packets} packets{R}")
-    print(f"{BBL}{'━' * w}{R}")
+    if not args.json_out:
+        w = tw()
+        print(f"\n{BBL}{'━' * w}{R}")
+        print(f"{BBL}{B}  GLOBALPING MTR{R}  {DIM}·{R}  {BWH}{B}{args.target_ip}{R}  "
+              f"{DIM}{args.protocol}  ·  {args.packets} packets{R}")
+        print(f"{BBL}{'━' * w}{R}")
 
     # ── Parallel: GeoIP + probe list ─────────────────────────────────────────
-    print(f"\n{DIM}  resolving…{R}", end="", flush=True)
+    log(f"\n{DIM}  resolving…{R}", end="", flush=True)
 
     geoip_result: dict = {}
     probes_result: list = []
@@ -538,7 +591,7 @@ def main():
     t_geoip.start();  t_probes.start()
     t_geoip.join();   t_probes.join()
 
-    print("\r", end="")
+    log("\r", end="")
 
     if errors:
         sys.exit(errors[0].code)
@@ -547,39 +600,51 @@ def main():
     if geoip_result.get("city") or geoip_result.get("country"):
         location = ", ".join(filter(None, [geoip_result["city"], geoip_result["country"]]))
         region_label = geoip_result.get("region") or "unknown region"
-        print(kv("target", f"{BWH}{location}{R}  {DIM}→  {region_label}{R}"))
+        log(kv("target", f"{BWH}{location}{R}  {DIM}→  {region_label}{R}"))
     else:
-        print(kv("target", f"{DIM}location unknown{R}"))
+        log(kv("target", f"{DIM}location unknown{R}"))
 
     if geoip_result.get("asn"):
         isp = geoip_result.get("network") or geoip_result.get("isp") or "?"
-        print(kv("isp / asn", f"AS{geoip_result['asn']}  {DIM}·  {isp}{R}"))
+        log(kv("isp / asn", f"AS{geoip_result['asn']}  {DIM}·  {isp}{R}"))
     else:
-        print(kv("isp / asn", f"{DIM}not found{R}"))
+        log(kv("isp / asn", f"{DIM}not found{R}"))
 
     # ── Select probes ─────────────────────────────────────────────────────────
     chosen_region, region_source, chosen_asn, asn_source, network_name = select_groups(
         probes_result, geoip_result.get("asn"), geoip_result.get("country")
     )
-    print(kv("probes",  f"{BGR}{len(probes_result)}{R} online"))
-    print(kv("region",  f"{BCY}{chosen_region}{R}  {DIM}· {region_source}{R}"))
-    print(kv("asn",     f"{BCY}AS{chosen_asn}  ·  {network_name}{R}  {DIM}· {asn_source}{R}"))
+    log(kv("probes",  f"{BGR}{len(probes_result)}{R} online"))
+    log(kv("region",  f"{BCY}{chosen_region}{R}  {DIM}· {region_source}{R}"))
+    log(kv("asn",     f"{BCY}AS{chosen_asn}  ·  {network_name}{R}  {DIM}· {asn_source}{R}"))
 
     # ── Measure ───────────────────────────────────────────────────────────────
-    print()
+    log("")
     measurement_id = create_measurement(
         args.target_ip, chosen_region, chosen_asn, args.packets, args.protocol, args.token
     )
-    print(f"  {DIM}id  {measurement_id}{R}")
+    log(f"  {DIM}id  {measurement_id}{R}")
 
-    data = poll_measurement(measurement_id, args.token)
+    data = poll_measurement(measurement_id, args.token, quiet=args.json_out)
     results = data.get("results") or []
 
     if not results:
         print(f"{BRD}No results returned.{R}", file=sys.stderr)
         sys.exit(1)
 
-    display_results(args.target_ip, results, chosen_region, chosen_asn, network_name)
+    if args.json_out:
+        probe_selection = {
+            "region":        chosen_region,
+            "region_source": region_source,
+            "asn":           chosen_asn,
+            "asn_source":    asn_source,
+            "network":       network_name,
+            "probes_online": len(probes_result),
+        }
+        out = build_json_output(args.target_ip, geoip_result, probe_selection, results)
+        print(json.dumps(out, indent=2))
+    else:
+        display_results(args.target_ip, results, chosen_region, chosen_asn, network_name)
 
 
 if __name__ == "__main__":
